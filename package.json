@@ -12,6 +12,7 @@
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsc",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "engines": {

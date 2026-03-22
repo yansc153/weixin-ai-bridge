@@ -117,8 +117,11 @@ if ($pipCmd) {
   Write-OK "pip 镜像已配置"
 }
 
-# ── 9. 启动应用 ──────────────────────────────────────────────
+# ── 9. 安装并启动 weixin-ai-bridge ───────────────────────────
 Write-Host ""
-Write-Host "环境准备完成，正在启动 weixin-ai-bridge..." -ForegroundColor Green
+Write-Host "环境准备完成，正在安装 weixin-ai-bridge..." -ForegroundColor Green
 Write-Host ""
-npx weixin-ai-bridge @args
+
+# Install globally from GitHub (works without npm publish)
+npm install -g yansc153/weixin-ai-bridge
+weixin-ai-bridge @args
