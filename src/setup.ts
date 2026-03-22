@@ -55,7 +55,13 @@ function whichSync(cmd: string): string | null {
 }
 
 function createRL(): readline.Interface {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // When invoked via `curl | bash`, stdin is a pipe (not a TTY) and gives
+  // immediate EOF — reopen from /dev/tty so the wizard can read keystrokes.
+  let input: NodeJS.ReadableStream = process.stdin;
+  if (!process.stdin.isTTY) {
+    try { input = fs.createReadStream("/dev/tty"); } catch { /* Windows or no tty */ }
+  }
+  const rl = readline.createInterface({ input, output: process.stdout });
   rl.on("close", () => { console.log(`\n${c.dim}Setup cancelled.${c.reset}`); process.exit(0); });
   return rl;
 }
