@@ -22,7 +22,7 @@
 ## 简介 · Overview
 
 ```bash
-npx weixin-ai-bridge
+curl -fsSL https://cdn.jsdelivr.net/gh/yansc153/weixin-ai-bridge/install.sh | bash
 ```
 
 **一条命令，让微信接入任意 AI。** 内置交互式配置向导，无需额外开发。
