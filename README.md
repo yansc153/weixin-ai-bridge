@@ -21,15 +21,13 @@
 
 ## 简介 · Overview
 
-**weixin-ai-bridge** 通过微信 iLink Bot API，将微信消息实时转发给 AI，并将 AI 回复推送回微信。
-只需一行命令启动，内置交互式配置向导，无需额外开发。
-
-**weixin-ai-bridge** connects your WeChat to any AI backend via the WeChat iLink Bot API.
-Launch with a single command — a built-in setup wizard handles everything.
-
 ```bash
 npx weixin-ai-bridge
 ```
+
+**一条命令，让微信接入任意 AI。** 内置交互式配置向导，无需额外开发。
+
+**One command to bridge WeChat with any AI.** Built-in setup wizard, no extra coding needed.
 
 ---
 
