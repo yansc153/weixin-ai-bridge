@@ -109,6 +109,15 @@ echo ""
 echo -e "${BOLD}${GREEN}环境准备完成，正在安装 weixin-ai-bridge...${RESET}"
 echo ""
 
-# Install globally from GitHub (works without npm publish)
-npm install -g git+https://github.com/yansc153/weixin-ai-bridge.git
+# Download tarball (pure HTTPS, no git/SSH needed), build, and install globally
+WAB_TMP=$(mktemp -d)
+trap 'rm -rf "$WAB_TMP"' EXIT
+curl -fsSL https://github.com/yansc153/weixin-ai-bridge/archive/refs/heads/main.tar.gz \
+  | tar xz -C "$WAB_TMP" --strip-components=1
+cd "$WAB_TMP"
+npm install
+npm run build
+npm install -g --ignore-scripts .
+cd /
+
 exec weixin-ai-bridge "$@"

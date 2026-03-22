@@ -122,6 +122,22 @@ Write-Host ""
 Write-Host "环境准备完成，正在安装 weixin-ai-bridge..." -ForegroundColor Green
 Write-Host ""
 
-# Install globally from GitHub (works without npm publish)
-npm install -g git+https://github.com/yansc153/weixin-ai-bridge.git
+# Download tarball (pure HTTPS, no git/SSH needed), build, and install globally
+$WabTmp = Join-Path $env:TEMP ("wab_" + [System.IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $WabTmp | Out-Null
+try {
+  $zipUrl = "https://github.com/yansc153/weixin-ai-bridge/archive/refs/heads/main.zip"
+  $zipPath = Join-Path $WabTmp "wab.zip"
+  Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
+  Expand-Archive -Path $zipPath -DestinationPath $WabTmp
+  $srcDir = Join-Path $WabTmp "weixin-ai-bridge-main"
+  Set-Location $srcDir
+  npm install
+  npm run build
+  npm install -g --ignore-scripts .
+} finally {
+  Set-Location $HOME
+  Remove-Item -Recurse -Force $WabTmp -ErrorAction SilentlyContinue
+}
+
 weixin-ai-bridge @args
