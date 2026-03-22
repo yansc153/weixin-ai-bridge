@@ -50,7 +50,7 @@ export class OllamaAgent implements AgentBackend {
           console.log(`[ollama] 清理闲置会话: ${userId}`);
         }
       }
-    }, CLEANUP_INTERVAL_MS);
+    }, CLEANUP_INTERVAL_MS).unref();
   }
 
   async ask(userId: string, message: string): Promise<string> {

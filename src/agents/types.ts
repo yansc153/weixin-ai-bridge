@@ -2,6 +2,11 @@
  * Agent backend interface — the only contract a backend needs to implement.
  */
 
+export interface ImageAttachment {
+  mimeType: string;
+  data: Buffer;
+}
+
 export interface AgentBackend {
   /** Human-readable name for display. */
   name: string;
@@ -9,12 +14,14 @@ export interface AgentBackend {
   ask(userId: string, message: string): Promise<string>;
   /** Stream a response, calling onChunk with accumulated text on each delta. */
   askStream?(userId: string, message: string, onChunk: (text: string, done: boolean) => void): Promise<string>;
+  /** Process a message with image attachments (vision). If not implemented, agent doesn't support images. */
+  askWithImages?(userId: string, message: string, images: ImageAttachment[], onChunk?: (text: string, done: boolean) => void): Promise<string>;
   /** Clear conversation history for a user. */
   reset(userId: string): void;
 }
 
 export interface AgentConfig {
-  agent: "claude-code" | "openai" | "anthropic" | "ollama" | "command";
+  agent: "claude-code" | "openai" | "anthropic" | "ollama" | "command" | "codex" | "gemini";
   model?: string;
   apiKey?: string;
   apiBase?: string;
@@ -27,6 +34,14 @@ export async function createAgent(config: AgentConfig): Promise<AgentBackend> {
     case "claude-code": {
       const { ClaudeCodeAgent } = await import("./claude-code.js");
       return new ClaudeCodeAgent();
+    }
+    case "codex": {
+      const { CodexAgent } = await import("./codex.js");
+      return new CodexAgent();
+    }
+    case "gemini": {
+      const { GeminiAgent } = await import("./gemini.js");
+      return new GeminiAgent();
     }
     case "openai": {
       const { OpenAIAgent } = await import("./openai.js");

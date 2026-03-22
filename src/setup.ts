@@ -137,6 +137,14 @@ async function testConnection(config: AgentConfig): Promise<boolean> {
       execSync("claude --version", { encoding: "utf-8", timeout: 5000 });
       return true;
     }
+    if (config.agent === "codex") {
+      execSync("codex --version", { encoding: "utf-8", timeout: 5000 });
+      return true;
+    }
+    if (config.agent === "gemini") {
+      execSync("gemini --version", { encoding: "utf-8", timeout: 5000 });
+      return true;
+    }
     if (config.agent === "ollama") {
       const body = JSON.stringify({ model: config.model, prompt: "Say hi", stream: false });
       const res = await fetch(`${config.apiBase}/api/generate`, {
@@ -160,21 +168,56 @@ async function testConnection(config: AgentConfig): Promise<boolean> {
   } catch { return false; }
 }
 
+async function verifyLocalCLI(
+  rl: readline.Interface,
+  binary: string,
+  installCmd: string,
+  envKeyName?: string,
+): Promise<void> {
+  info(`Verifying ${binary} CLI...`);
+  try {
+    const ver = execSync(`${binary} --version`, { encoding: "utf-8", timeout: 5000 }).trim();
+    ok(`${binary} ${ver}`);
+  } catch {
+    fail(`Could not run '${binary} --version'. Install with: ${installCmd}`);
+    rl.close(); process.exit(1);
+  }
+  if (envKeyName) {
+    const envVal = process.env[envKeyName];
+    if (!envVal) {
+      warn(`${envKeyName} is not set in environment.`);
+      const key = await askSecret(rl, `${binary} API key`);
+      if (key) {
+        process.env[envKeyName] = key;
+        ok(`Key saved for this session: ${c.dim}${maskKey(key)}${c.reset}`);
+        warn(`Add ${envKeyName} to your shell profile to persist across restarts.`);
+      }
+    } else {
+      ok(`${envKeyName} detected: ${c.dim}${maskKey(envVal)}${c.reset}`);
+    }
+  }
+}
+
 // ── Main wizard ──────────────────────────────────────────────────────────────
 
 export async function runSetup(): Promise<AgentConfig> {
-  console.log(`\n${c.magenta}${c.bold}  weixin-ai-bridge Setup Wizard${c.reset}\n`);
+  console.log(`\n${c.magenta}${c.bold}  weixin-ai-bridge Setup Wizard${c.reset}`);
+  console.log(`  ${c.dim}作者：花椒${c.reset}\n`);
   const rl = createRL();
 
-  // Detect local tools
+  // Detect local CLI tools
   const hasClaude = whichSync("claude");
-  const hasCursor = whichSync("cursor");
+  const hasCodex  = whichSync("codex");
+  const hasGemini = whichSync("gemini");
   if (hasClaude) ok(`Detected claude CLI at ${c.dim}${hasClaude}${c.reset}`);
-  if (hasCursor) ok(`Detected cursor CLI at ${c.dim}${hasCursor}${c.reset}`);
+  if (hasCodex)  ok(`Detected codex CLI at ${c.dim}${hasCodex}${c.reset}`);
+  if (hasGemini) ok(`Detected gemini CLI at ${c.dim}${hasGemini}${c.reset}`);
 
   // Build backend choices
   const opts: { label: string; value: AgentConfig["agent"] }[] = [];
-  if (hasClaude) opts.push({ label: "Claude Code (local CLI)", value: "claude-code" });
+  if (hasClaude) opts.push({ label: "Claude Code  (Anthropic, local CLI)", value: "claude-code" });
+  if (hasCodex)  opts.push({ label: "Codex CLI    (OpenAI, local CLI)", value: "codex" });
+  if (hasGemini) opts.push({ label: "Gemini CLI   (Google, local CLI)", value: "gemini" });
   opts.push(
     { label: "OpenAI-Compatible API", value: "openai" },
     { label: "Anthropic API", value: "anthropic" },
@@ -184,15 +227,16 @@ export async function runSetup(): Promise<AgentConfig> {
   const idx = await choose(rl, "Select AI backend:", opts.map((o) => o.label));
   const config: AgentConfig = { agent: opts[idx].value };
 
-  // ── Claude Code path
   if (config.agent === "claude-code") {
-    info("Verifying claude CLI...");
-    try {
-      ok(`claude ${execSync("claude --version", { encoding: "utf-8" }).trim()}`);
-    } catch {
-      fail("Could not run 'claude --version'. Make sure it is installed and in PATH.");
-      rl.close(); process.exit(1);
-    }
+    await verifyLocalCLI(rl, "claude", "npm i -g @anthropic-ai/claude-code");
+  }
+
+  if (config.agent === "codex") {
+    await verifyLocalCLI(rl, "codex", "npm i -g @openai/codex", "OPENAI_API_KEY");
+  }
+
+  if (config.agent === "gemini") {
+    await verifyLocalCLI(rl, "gemini", "npm i -g @google/gemini-cli", "GEMINI_API_KEY");
   }
 
   // ── API-based backends

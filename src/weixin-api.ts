@@ -36,9 +36,9 @@ export interface MessageItem {
   type?: number;
   text_item?: { text?: string };
   image_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; aeskey?: string };
-  voice_item?: { media?: { encrypt_query_param?: string }; text?: string };
-  file_item?: { media?: { encrypt_query_param?: string }; file_name?: string };
-  video_item?: { media?: { encrypt_query_param?: string } };
+  voice_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; text?: string };
+  file_item?: { media?: { encrypt_query_param?: string; aes_key?: string }; file_name?: string };
+  video_item?: { media?: { encrypt_query_param?: string; aes_key?: string } };
   ref_msg?: { message_item?: MessageItem; title?: string };
 }
 
@@ -292,6 +292,17 @@ export async function pollQRStatus(
     }
     throw err;
   }
+}
+
+/** Detect non-text media types in a message for logging and user feedback. */
+export function detectMediaTypes(msg: WeixinMessage): { hasImage: boolean; hasVoice: boolean; hasFile: boolean; hasVideo: boolean } {
+  const items = msg.item_list ?? [];
+  return {
+    hasImage: items.some(i => i.type === MessageItemType.IMAGE),
+    hasVoice: items.some(i => i.type === MessageItemType.VOICE),
+    hasFile:  items.some(i => i.type === MessageItemType.FILE),
+    hasVideo: items.some(i => i.type === MessageItemType.VIDEO),
+  };
 }
 
 /** Extract text body from a message's item_list. */

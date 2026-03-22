@@ -14,6 +14,7 @@ import { loginWithQR, loadAccount } from "./auth.js";
 import { startMonitor } from "./monitor.js";
 import { createAgent, type AgentConfig } from "./agents/types.js";
 import { runSetup, loadConfig, configExists } from "./setup.js";
+import { ensureDeps } from "./deps.js";
 import type { ApiConfig } from "./weixin-api.js";
 
 const HELP = `
@@ -69,6 +70,9 @@ async function main(): Promise<void> {
   console.log("║     一条命令，让微信连上 AI            ║");
   console.log("╚═══════════════════════════════════════╝");
   console.log();
+
+  // Check and install optional dependencies (ffmpeg, whisper, etc.)
+  await ensureDeps();
 
   // Resolve agent config: CLI flags > saved config > interactive setup
   let agentConfig: AgentConfig;

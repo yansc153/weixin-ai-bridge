@@ -2,25 +2,22 @@
  * Agent backend: Anthropic Claude API (raw fetch, no SDK dependency).
  */
 
-import type { AgentBackend } from "./types.js";
+import type { AgentBackend, ImageAttachment } from "./types.js";
 import { sanitizeErrorMessage } from "./sanitize.js";
 
-type Message = { role: "user" | "assistant"; content: string };
+type TextMessage = { role: "user" | "assistant"; content: string };
+type AnyMessage = TextMessage | { role: "user"; content: unknown[] };
 
 const FETCH_TIMEOUT_MS = 120_000; // 120s
 const IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
 const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_MESSAGES_BEFORE_COMPRESS = 20;
 
-function compressHistory(history: Message[]): Message[] {
+function compressHistory(history: AnyMessage[]): AnyMessage[] {
   if (history.length <= MAX_MESSAGES_BEFORE_COMPRESS) return history;
-  // Anthropic has no system message in history, so keep first 5, summary, last 10
   const early = history.slice(0, 5);
   const recent = history.slice(-10);
-  const summary: Message = {
-    role: "assistant",
-    content: "[earlier conversation summarized]",
-  };
+  const summary: TextMessage = { role: "assistant", content: "[earlier conversation summarized]" };
   return [...early, summary, ...recent];
 }
 
@@ -30,7 +27,7 @@ export class AnthropicAgent implements AgentBackend {
   private apiBase: string;
   private model: string;
   private systemPrompt: string;
-  private conversations = new Map<string, Message[]>();
+  private conversations = new Map<string, AnyMessage[]>();
   private lastActivity = new Map<string, number>();
   private cleanupTimer: ReturnType<typeof setInterval>;
 
@@ -51,7 +48,7 @@ export class AnthropicAgent implements AgentBackend {
           console.log(`[anthropic] 清理闲置会话: ${userId}`);
         }
       }
-    }, CLEANUP_INTERVAL_MS);
+    }, CLEANUP_INTERVAL_MS).unref();
   }
 
   async ask(userId: string, message: string): Promise<string> {
@@ -215,6 +212,125 @@ export class AnthropicAgent implements AgentBackend {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[anthropic] 流式错误:`, msg);
+      return `⚠️ Anthropic 出错: ${sanitizeErrorMessage(msg)}`;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async askWithImages(
+    userId: string,
+    message: string,
+    images: ImageAttachment[],
+    onChunk?: (text: string, done: boolean) => void,
+  ): Promise<string> {
+    if (!this.apiKey) return "⚠️ 未设置 API Key。用 --api-key 或 ANTHROPIC_API_KEY 环境变量配置。";
+
+    this.lastActivity.set(userId, Date.now());
+
+    let history = this.conversations.get(userId);
+    if (!history) {
+      history = [];
+      this.conversations.set(userId, history);
+    }
+
+    // Build multimodal content: images first, then text
+    const content: unknown[] = images.map((img) => ({
+      type: "image",
+      source: { type: "base64", media_type: img.mimeType, data: img.data.toString("base64") },
+    }));
+    if (message) content.push({ type: "text", text: message });
+
+    // Store text summary in history (not the base64 blobs)
+    const historyText = `[用户发送了${images.length}张图片]${message ? " " + message : ""}`;
+    history.push({ role: "user", content });
+
+    if (history.length > MAX_MESSAGES_BEFORE_COMPRESS) {
+      history = compressHistory(history);
+      this.conversations.set(userId, history);
+    }
+
+    const startTime = Date.now();
+    console.log(`[anthropic] 视觉调用 ${this.model} (${images.length}图)`);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(`${this.apiBase}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": this.apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: this.model,
+          max_tokens: 4096,
+          system: this.systemPrompt,
+          messages: history,
+          stream: !!onChunk,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`${res.status}: ${err}`);
+      }
+
+      let reply: string;
+
+      if (onChunk) {
+        let accumulated = "";
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let currentEvent = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.startsWith("event: ")) { currentEvent = trimmed.slice(7); continue; }
+            if (!trimmed.startsWith("data: ")) continue;
+            try {
+              const parsed = JSON.parse(trimmed.slice(6));
+              if (currentEvent === "content_block_delta" && parsed.delta?.text) {
+                accumulated += parsed.delta.text;
+                onChunk(accumulated, false);
+              } else if (currentEvent === "message_stop") {
+                onChunk(accumulated, true);
+              }
+            } catch { /* skip */ }
+            currentEvent = "";
+          }
+        }
+        if (accumulated) onChunk(accumulated, true);
+        reply = accumulated;
+      } else {
+        const data = await res.json() as { content: { type: string; text: string }[] };
+        reply = data.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      }
+
+      // Replace the multimodal history entry with text summary for future turns
+      let idx = -1;
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i].role === "user" && Array.isArray((history[i] as { content: unknown }).content)) { idx = i; break; }
+      }
+      if (idx >= 0) (history[idx] as TextMessage) = { role: "user", content: historyText };
+      history.push({ role: "assistant", content: reply });
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[anthropic] 视觉完成 (${elapsed}s, ${reply.length} chars)`);
+      return reply || "[无回复]";
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[anthropic] 视觉错误:`, msg);
       return `⚠️ Anthropic 出错: ${sanitizeErrorMessage(msg)}`;
     } finally {
       clearTimeout(timeout);

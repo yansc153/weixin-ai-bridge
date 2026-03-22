@@ -12,12 +12,15 @@ import {
   sendTyping,
   getConfig,
   extractTextBody,
+  detectMediaTypes,
+  MessageItemType,
   type ApiConfig,
   type GetUpdatesResp,
   type WeixinMessage,
 } from "./weixin-api.js";
 import { DATA_DIR } from "./auth.js";
-import type { AgentBackend } from "./agents/types.js";
+import type { AgentBackend, ImageAttachment } from "./agents/types.js";
+import { downloadMediaItem, extractDocumentText, extractVideoContent, transcribeVoiceData } from "./cdn.js";
 
 const SYNC_BUF_FILE = path.join(DATA_DIR, "sync-buf.txt");
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -81,21 +84,91 @@ async function processMessage(
 ): Promise<void> {
   const userId = msg.from_user_id ?? "";
   const contextToken = msg.context_token ?? "";
-  const textBody = extractTextBody(msg);
+  if (!userId) return;
 
-  if (!userId || !textBody) return;
-
-  if (contextToken) {
-    contextTokens.set(userId, contextToken);
-  }
-
+  if (contextToken) contextTokens.set(userId, contextToken);
   const ct = contextTokens.get(userId);
   if (!ct) {
     console.log(`[monitor] 无 contextToken, 跳过 from=${userId}`);
     return;
   }
 
-  console.log(`[monitor] 收到消息 from=${userId}: ${textBody.slice(0, 80)}${textBody.length > 80 ? "..." : ""}`);
+  const textBody = extractTextBody(msg);
+  const media = detectMediaTypes(msg);
+
+  // Download images, files, and video
+  const downloadedImages: ImageAttachment[] = [];
+  let effectiveText = textBody;
+
+  // Download voice only as fallback when WeChat didn't provide a transcription
+  const needsVoiceDownload = media.hasVoice && !textBody;
+
+  if (media.hasImage || media.hasFile || media.hasVideo || needsVoiceDownload) {
+    const mediaItems = (msg.item_list ?? []).filter(
+      (item) => item.type === MessageItemType.IMAGE ||
+        item.type === MessageItemType.FILE ||
+        item.type === MessageItemType.VIDEO ||
+        (item.type === MessageItemType.VOICE && needsVoiceDownload),
+    );
+    const downloadResults = await Promise.all(mediaItems.map((item) => downloadMediaItem(item)));
+    for (const downloaded of downloadResults) {
+      if (!downloaded) continue;
+      if (downloaded.type === "image") {
+        downloadedImages.push({ mimeType: downloaded.mimeType, data: downloaded.data });
+        console.log(`[monitor] 图片已下载 ${downloaded.data.length} bytes`);
+      } else if (downloaded.type === "file") {
+        const fname = downloaded.fileName ?? "unknown";
+        const text = await extractDocumentText(downloaded.data, fname);
+        if (text) {
+          effectiveText = (effectiveText ? effectiveText + "\n\n" : "")
+            + `[文件: ${fname}]\n\`\`\`\n${text}\n\`\`\``;
+          console.log(`[monitor] 文件已提取文本 ${text.length} chars (${fname})`);
+        } else {
+          await sendMessage(cfg, userId, `📎 收到文件 "${fname}"，格式暂不支持内容提取`, ct).catch(() => {});
+        }
+      } else if (downloaded.type === "voice") {
+        console.log(`[monitor] 语音已下载 ${downloaded.data.length} bytes，正在转录...`);
+        const transcript = await transcribeVoiceData(downloaded.data);
+        if (transcript) {
+          effectiveText = transcript;
+          console.log(`[monitor] 语音转录完成 (${transcript.length} chars)`);
+        }
+      } else if (downloaded.type === "video") {
+        console.log(`[monitor] 视频已下载 ${(downloaded.data.length / 1024 / 1024).toFixed(1)} MB，提取帧...`);
+        await sendMessage(cfg, userId, "🎬 收到视频，正在分析...", ct).catch(() => {});
+        const analysis = await extractVideoContent(downloaded.data);
+        if (analysis) {
+          for (const frame of analysis.frames) downloadedImages.push(frame);
+          const hint = [`[视频分析，时长约 ${analysis.durationSec?.toFixed(0) ?? "?"} 秒，提取了 ${analysis.frames.length} 帧]`];
+          if (analysis.transcript) hint.push(`[音频转录]: ${analysis.transcript}`);
+          if (effectiveText) hint.push(effectiveText);
+          effectiveText = hint.join("\n");
+          console.log(`[monitor] 视频提取完成: ${analysis.frames.length} 帧${analysis.transcript ? " + 转录" : ""}`);
+        } else {
+          await sendMessage(cfg, userId, "📎 视频处理失败，请发截图或描述问题", ct).catch(() => {});
+        }
+      }
+    }
+  }
+
+  // Nothing processable
+  if (!effectiveText && downloadedImages.length === 0) {
+    if (media.hasImage) {
+      await sendMessage(cfg, userId, "📎 图片下载失败，请稍后重试或用文字描述问题", ct).catch(() => {});
+    } else if (media.hasFile) {
+      await sendMessage(cfg, userId, "📎 文件下载失败，请稍后重试", ct).catch(() => {});
+    } else if (media.hasVideo) {
+      await sendMessage(cfg, userId, "📎 视频处理失败，请发截图或描述问题", ct).catch(() => {});
+    } else if (media.hasVoice) {
+      await sendMessage(cfg, userId, "🎤 收到语音，未能识别内容，请手动输入文字", ct).catch(() => {});
+    } else {
+      await sendMessage(cfg, userId, "📎 暂不支持该消息类型，请发送文字", ct).catch(() => {});
+    }
+    return;
+  }
+
+  const previewText = effectiveText || `[${downloadedImages.length}张图片]`;
+  console.log(`[monitor] 收到消息 from=${userId}: ${previewText.slice(0, 80)}${previewText.length > 80 ? "..." : ""}`);
 
   // Handle special commands
   if (textBody === "/reset" || textBody === "/清除") {
@@ -128,37 +201,119 @@ async function processMessage(
   } catch { /* best-effort */ }
 
   try {
-    // Use streaming if agent supports it
-    if (agent.askStream) {
-      await processMessageStreaming(cfg, agent, userId, textBody, ct, typingTicket);
+    if (downloadedImages.length > 0 && agent.askWithImages) {
+      // Vision path: agent supports images
+      await processMessageWithImages(cfg, agent, userId, effectiveText || "", downloadedImages, ct, typingTicket);
+    } else if (downloadedImages.length > 0) {
+      // Images downloaded but agent doesn't support vision
+      await sendMessage(cfg, userId, "📎 当前 AI 不支持图片分析，请用文字描述问题", ct).catch(() => {});
+      if (!effectiveText) return;
+      // If there's also text, fall through to text-only processing
+      if (agent.askStream) {
+        await processMessageStreaming(cfg, agent, userId, effectiveText, ct, typingTicket);
+      } else {
+        const response = await agent.ask(userId, effectiveText);
+        const cleaned = stripMarkdown(response);
+        for (const chunk of chunkText(cleaned)) {
+          await sendMessage(cfg, userId, chunk, contextTokens.get(userId) ?? ct);
+        }
+        console.log(`[monitor] 已回复 to=${userId} (${cleaned.length} chars)`);
+      }
+    } else if (agent.askStream) {
+      await processMessageStreaming(cfg, agent, userId, effectiveText!, ct, typingTicket);
     } else {
       // Fallback: non-streaming path
-      const response = await agent.ask(userId, textBody);
-
-      // Strip markdown and send response in chunks
+      const response = await agent.ask(userId, effectiveText!);
       const cleaned = stripMarkdown(response);
       const chunks = chunkText(cleaned);
-
       for (const chunk of chunks) {
         const latestCt = contextTokens.get(userId) ?? ct;
         await sendMessage(cfg, userId, chunk, latestCt);
       }
-
       console.log(`[monitor] 已回复 to=${userId} (${cleaned.length} chars)`);
     }
   } finally {
-    // Always cancel typing indicator
-    try {
-      if (typingTicket) {
-        await sendTyping(cfg, userId, typingTicket, 2);
-      } else {
-        const config = await getConfig(cfg, userId, ct);
-        if (config.typing_ticket) {
-          await sendTyping(cfg, userId, config.typing_ticket, 2);
-        }
-      }
-    } catch { /* best-effort */ }
+    if (typingTicket) {
+      try { await sendTyping(cfg, userId, typingTicket, 2); } catch { /* best-effort */ }
+    }
   }
+}
+
+async function runStreamingReply(
+  cfg: ApiConfig,
+  userId: string,
+  ct: string,
+  typingTicket: string | undefined,
+  invoke: (onChunk: (text: string, done: boolean) => void) => Promise<string>,
+  label: string,
+): Promise<void> {
+  const clientId = crypto.randomUUID();
+  let lastSendTime = 0;
+  let lastSentText = "";
+  let pendingSend: ReturnType<typeof setTimeout> | null = null;
+  let latestText = "";
+
+  const sendUpdate = async (text: string, done: boolean) => {
+    const cleaned = stripMarkdown(text);
+    if (cleaned === lastSentText && !done) return;
+    const latestCt = contextTokens.get(userId) ?? ct;
+    try {
+      await sendMessageStreaming(cfg, userId, cleaned, latestCt, clientId, done);
+      lastSentText = cleaned;
+      lastSendTime = Date.now();
+    } catch (err) {
+      console.error(`[monitor] ${label}发送出错:`, err);
+    }
+    if (!done && typingTicket) {
+      try { await sendTyping(cfg, userId, typingTicket, 1); } catch { /* best-effort */ }
+    }
+  };
+
+  const onChunk = (text: string, done: boolean) => {
+    latestText = text;
+    if (done) {
+      if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
+      return;
+    }
+    const elapsed = Date.now() - lastSendTime;
+    if (elapsed >= STREAM_THROTTLE_MS) {
+      if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
+      sendUpdate(text, false).catch(() => {});
+    } else if (!pendingSend) {
+      pendingSend = setTimeout(() => {
+        pendingSend = null;
+        sendUpdate(latestText, false).catch(() => {});
+      }, STREAM_THROTTLE_MS - elapsed);
+    }
+  };
+
+  const response = await invoke(onChunk);
+
+  if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
+
+  const finalText = stripMarkdown(response || latestText);
+  if (finalText) {
+    const latestCt = contextTokens.get(userId) ?? ct;
+    await sendMessageStreaming(cfg, userId, finalText, latestCt, clientId, true);
+  }
+
+  console.log(`[monitor] ${label}完成 to=${userId} (${finalText.length} chars)`);
+}
+
+async function processMessageWithImages(
+  cfg: ApiConfig,
+  agent: AgentBackend,
+  userId: string,
+  message: string,
+  images: ImageAttachment[],
+  ct: string,
+  typingTicket: string | undefined,
+): Promise<void> {
+  console.log(`[monitor] 开始视觉回复 to=${userId} (${images.length}图)`);
+  await runStreamingReply(cfg, userId, ct, typingTicket,
+    (onChunk) => agent.askWithImages!(userId, message, images, onChunk),
+    "视觉回复",
+  );
 }
 
 async function processMessageStreaming(
@@ -169,89 +324,11 @@ async function processMessageStreaming(
   ct: string,
   typingTicket: string | undefined,
 ): Promise<void> {
-  // Generate ONE client_id reused for all streaming updates to the same bubble
-  const clientId = crypto.randomUUID();
-  let lastSendTime = 0;
-  let lastSentText = "";
-  let pendingSend: ReturnType<typeof setTimeout> | null = null;
-  let streamDone = false;
-  let latestText = "";
-
-  const sendUpdate = async (text: string, done: boolean) => {
-    const cleaned = stripMarkdown(text);
-    // Don't send if text hasn't changed
-    if (cleaned === lastSentText && !done) return;
-
-    const latestCt = contextTokens.get(userId) ?? ct;
-    try {
-      await sendMessageStreaming(cfg, userId, cleaned, latestCt, clientId, done);
-      lastSentText = cleaned;
-      lastSendTime = Date.now();
-    } catch (err) {
-      console.error(`[monitor] 流式发送出错:`, err);
-    }
-
-    // Refresh typing indicator during streaming
-    if (!done && typingTicket) {
-      try {
-        await sendTyping(cfg, userId, typingTicket, 1);
-      } catch { /* best-effort */ }
-    }
-  };
-
-  const onChunk = (text: string, done: boolean) => {
-    latestText = text;
-
-    if (done) {
-      streamDone = true;
-      // Cancel any pending throttled send
-      if (pendingSend) {
-        clearTimeout(pendingSend);
-        pendingSend = null;
-      }
-      return;
-    }
-
-    // Throttle: send at most once per STREAM_THROTTLE_MS
-    const now = Date.now();
-    const elapsed = now - lastSendTime;
-
-    if (elapsed >= STREAM_THROTTLE_MS) {
-      // Can send immediately
-      if (pendingSend) {
-        clearTimeout(pendingSend);
-        pendingSend = null;
-      }
-      sendUpdate(text, false).catch(() => {});
-    } else if (!pendingSend) {
-      // Schedule a send after remaining throttle time
-      const remaining = STREAM_THROTTLE_MS - elapsed;
-      pendingSend = setTimeout(() => {
-        pendingSend = null;
-        sendUpdate(latestText, false).catch(() => {});
-      }, remaining);
-    }
-    // If pendingSend already exists, the scheduled send will pick up latestText
-  };
-
   console.log(`[monitor] 开始流式回复 to=${userId}`);
-
-  const response = await agent.askStream!(userId, textBody, onChunk);
-
-  // Cancel any pending throttled send
-  if (pendingSend) {
-    clearTimeout(pendingSend);
-    pendingSend = null;
-  }
-
-  // Send final message with FINISH state
-  const finalText = stripMarkdown(response || latestText);
-  if (finalText) {
-    const latestCt = contextTokens.get(userId) ?? ct;
-    await sendMessageStreaming(cfg, userId, finalText, latestCt, clientId, true);
-  }
-
-  console.log(`[monitor] 流式回复完成 to=${userId} (${finalText.length} chars)`);
+  await runStreamingReply(cfg, userId, ct, typingTicket,
+    (onChunk) => agent.askStream!(userId, textBody, onChunk),
+    "流式回复",
+  );
 }
 
 export async function startMonitor(
