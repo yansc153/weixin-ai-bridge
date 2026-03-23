@@ -2,13 +2,11 @@
  * Long-poll message monitor: receives WeChat messages and dispatches to AI agent.
  */
 
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
   getUpdates,
   sendMessage,
-  sendMessageStreaming,
   sendTyping,
   getConfig,
   extractTextBody,
@@ -248,58 +246,33 @@ async function runStreamingReply(
   invoke: (onChunk: (text: string, done: boolean) => void) => Promise<string>,
   label: string,
 ): Promise<void> {
-  const clientId = crypto.randomUUID();
-  let lastSendTime = 0;
-  let lastSentText = "";
-  let pendingSend: ReturnType<typeof setTimeout> | null = null;
   let latestText = "";
-
-  const sendUpdate = async (text: string, done: boolean) => {
-    const cleaned = stripMarkdown(text);
-    if (cleaned === lastSentText && !done) return;
-    const latestCt = contextTokens.get(userId)?.ct ?? ct;
-    try {
-      await sendMessageStreaming(cfg, userId, cleaned, latestCt, clientId, done);
-      lastSentText = cleaned;
-      lastSendTime = Date.now();
-    } catch (err) {
-      console.error(`[monitor] ${label}发送出错:`, err);
-    }
-    if (!done && typingTicket) {
-      try { await sendTyping(cfg, userId, typingTicket, 1); } catch { /* best-effort */ }
-    }
-  };
+  let lastTypingAt = 0;
 
   const onChunk = (text: string, done: boolean) => {
     latestText = text;
-    if (done) {
-      if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
-      return;
-    }
-    const elapsed = Date.now() - lastSendTime;
-    if (elapsed >= STREAM_THROTTLE_MS) {
-      if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
-      sendUpdate(text, false).catch(() => {});
-    } else if (!pendingSend) {
-      pendingSend = setTimeout(() => {
-        pendingSend = null;
-        sendUpdate(latestText, false).catch(() => {});
-      }, STREAM_THROTTLE_MS - elapsed).unref();
+    if (!done && typingTicket) {
+      const now = Date.now();
+      if (now - lastTypingAt >= STREAM_THROTTLE_MS) {
+        lastTypingAt = now;
+        sendTyping(cfg, userId, typingTicket, 1).catch(() => {});
+      }
     }
   };
 
   const response = await invoke(onChunk);
 
-  if (pendingSend) { clearTimeout(pendingSend); pendingSend = null; }
-
   const finalText = stripMarkdown(response || latestText);
   if (finalText) {
     const latestCt = contextTokens.get(userId)?.ct ?? ct;
-    await sendMessageStreaming(cfg, userId, finalText, latestCt, clientId, true);
+    for (const chunk of chunkText(finalText)) {
+      await sendMessage(cfg, userId, chunk, latestCt);
+    }
   }
 
-  console.log(`[monitor] ${label}完成 to=${userId} (${finalText.length} chars)`);
+  console.log(`[monitor] ${label} done to=${userId} (${finalText.length} chars)`);
 }
+
 
 async function processMessageWithImages(
   cfg: ApiConfig,

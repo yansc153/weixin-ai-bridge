@@ -1,17 +1,17 @@
 /**
- * Agent backend: Gemini CLI (--output-format json/stream-json mode).
- * Requires `gemini` CLI installed globally (npm i -g @google/gemini-cli).
+ * Agent backend: Gemini CLI.
+ * Requires `gemini` CLI installed globally.
  */
 
-import { execFile, spawn } from "node:child_process";
+import { exec, execFile, spawn } from "node:child_process";
 import type { AgentBackend } from "./types.js";
 import { sanitizeErrorMessage } from "./sanitize.js";
 
 const userSessions = new Map<string, string>();
 const lastActivity = new Map<string, number>();
 
-const IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
-const CLEANUP_INTERVAL_MS = 30 * 60 * 1000;  // 30 minutes
+const IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
@@ -19,13 +19,30 @@ setInterval(() => {
     if (now - ts > IDLE_TIMEOUT_MS) {
       userSessions.delete(userId);
       lastActivity.delete(userId);
-      console.log(`[gemini] 清理闲置会话: ${userId}`);
+      console.log(`[gemini] cleaned idle session: ${userId}`);
     }
   }
 }, CLEANUP_INTERVAL_MS).unref();
 
 export class GeminiAgent implements AgentBackend {
   name = "Gemini CLI";
+  private bin = process.env.GEMINI_BIN || (process.platform === "win32" ? "gemini.cmd" : "gemini");
+
+  private quoteWinArg(arg: string): string {
+    return `"${arg.replace(/"/g, '""')}"`;
+  }
+
+  private parseResult(stdout: string): { text: string; sessionId?: string } {
+    try {
+      const result = JSON.parse(stdout);
+      return {
+        sessionId: result.session_id,
+        text: result.result ?? result.response ?? result.text ?? "",
+      };
+    } catch {
+      return { text: stdout.trim() };
+    }
+  }
 
   async ask(userId: string, message: string): Promise<string> {
     return this._ask(userId, message, false);
@@ -47,18 +64,13 @@ export class GeminiAgent implements AgentBackend {
 
     return new Promise((resolve) => {
       const startTime = Date.now();
-      const bin = process.env.GEMINI_BIN || "gemini";
-      console.log(`[gemini] 调用${sessionId ? ` (resume=${sessionId.slice(0, 8)}...)` : " (新会话)"}`);
+      console.log(`[gemini] call${sessionId ? ` (resume=${sessionId.slice(0, 8)}...)` : " (new session)"}`);
 
-      execFile(bin, args, {
-        maxBuffer: 10 * 1024 * 1024,
-        timeout: 5 * 60 * 1000,
-        env: { ...process.env },
-      }, (error, stdout) => {
+      const done = (error: Error | null, stdout: string) => {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
         if (error) {
-          console.error(`[gemini] 错误 (${elapsed}s):`, error.message);
+          console.error(`[gemini] error (${elapsed}s):`, error.message);
           if (sessionId && !isRetry) {
             userSessions.delete(userId);
             resolve(this._ask(userId, message, true));
@@ -68,24 +80,40 @@ export class GeminiAgent implements AgentBackend {
           return;
         }
 
-        try {
-          const result = JSON.parse(stdout);
-          if (result.session_id) {
-            userSessions.set(userId, result.session_id);
-          }
-          const text = result.result ?? result.response ?? result.text ?? "";
-          console.log(`[gemini] 完成 (${elapsed}s, ${text.length} chars)`);
-          resolve(text || "[Gemini 处理完成，无文本输出]");
-        } catch {
-          const text = stdout.trim();
-          console.log(`[gemini] 完成 (${elapsed}s, ${text.length} chars)`);
-          resolve(text || "[Gemini 无输出]");
+        const parsed = this.parseResult(stdout);
+        if (parsed.sessionId) {
+          userSessions.set(userId, parsed.sessionId);
         }
-      });
+        console.log(`[gemini] done (${elapsed}s, ${parsed.text.length} chars)`);
+        resolve(parsed.text || "[Gemini completed with no text output]");
+      };
+
+      if (process.platform === "win32") {
+        const cmdline = [this.quoteWinArg(this.bin), ...args.map((arg) => this.quoteWinArg(arg))].join(" ");
+        exec(cmdline, {
+          shell: "cmd.exe",
+          windowsHide: true,
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: 5 * 60 * 1000,
+          env: { ...process.env },
+        }, (error, stdout) => done(error, stdout));
+        return;
+      }
+
+      execFile(this.bin, args, {
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 5 * 60 * 1000,
+        env: { ...process.env },
+      }, (error, stdout) => done(error, stdout));
     });
   }
 
   async askStream(userId: string, message: string, onChunk: (text: string, done: boolean) => void): Promise<string> {
+    if (process.platform === "win32") {
+      const text = await this._ask(userId, message, false);
+      onChunk(text, true);
+      return text;
+    }
     return this._askStream(userId, message, onChunk, false);
   }
 
@@ -105,10 +133,9 @@ export class GeminiAgent implements AgentBackend {
 
     return new Promise((resolve) => {
       const startTime = Date.now();
-      const bin = process.env.GEMINI_BIN || "gemini";
-      console.log(`[gemini] 流式调用${sessionId ? ` (resume=${sessionId.slice(0, 8)}...)` : " (新会话)"}`);
+      console.log(`[gemini] stream call${sessionId ? ` (resume=${sessionId.slice(0, 8)}...)` : " (new session)"}`);
 
-      const child = spawn(bin, args, {
+      const child = spawn(this.bin, args, {
         env: { ...process.env },
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -120,7 +147,7 @@ export class GeminiAgent implements AgentBackend {
 
       const timeout = setTimeout(() => {
         child.kill();
-        resolve(`⚠️ Gemini CLI 超时`);
+        resolve("⚠️ Gemini CLI 超时");
       }, 5 * 60 * 1000);
 
       child.stdout.on("data", (data: Buffer) => {
@@ -141,9 +168,7 @@ export class GeminiAgent implements AgentBackend {
             if (parsed.type === "assistant" && parsed.message?.content) {
               let text = "";
               for (const block of parsed.message.content) {
-                if (block.type === "text" && block.text) {
-                  text += block.text;
-                }
+                if (block.type === "text" && block.text) text += block.text;
               }
               if (text) {
                 accumulated = text;
@@ -160,9 +185,14 @@ export class GeminiAgent implements AgentBackend {
               const text = parsed.result ?? parsed.response ?? parsed.text ?? accumulated;
               if (text) accumulated = text;
               if (parsed.session_id) newSessionId = parsed.session_id;
-              if (!doneSent) { doneSent = true; onChunk(accumulated, true); }
+              if (!doneSent) {
+                doneSent = true;
+                onChunk(accumulated, true);
+              }
             }
-          } catch { /* skip malformed lines */ }
+          } catch {
+            // ignore malformed lines
+          }
         }
       });
 
@@ -175,18 +205,19 @@ export class GeminiAgent implements AgentBackend {
         clearTimeout(timeout);
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-        // Flush any incomplete last line in the buffer
         if (buffer.trim()) {
           try {
             const parsed = JSON.parse(buffer.trim());
             if (parsed.session_id) newSessionId = parsed.session_id;
             const text = parsed.result ?? parsed.response ?? parsed.text;
             if (text) accumulated = text;
-          } catch { /* incomplete line, ignore */ }
+          } catch {
+            // ignore incomplete final line
+          }
         }
 
         if (code !== 0 && !accumulated) {
-          console.error(`[gemini] 流式退出 code=${code} (${elapsed}s)`);
+          console.error(`[gemini] stream exit code=${code} (${elapsed}s)`);
           if (sessionId && !isRetry) {
             userSessions.delete(userId);
             resolve(this._askStream(userId, message, onChunk, true));
@@ -205,13 +236,13 @@ export class GeminiAgent implements AgentBackend {
           onChunk(accumulated, true);
         }
 
-        console.log(`[gemini] 流式完成 (${elapsed}s, ${accumulated.length} chars)`);
-        resolve(accumulated || "[Gemini 处理完成，无文本输出]");
+        console.log(`[gemini] stream done (${elapsed}s, ${accumulated.length} chars)`);
+        resolve(accumulated || "[Gemini completed with no text output]");
       });
 
       child.on("error", (err) => {
         clearTimeout(timeout);
-        console.error(`[gemini] spawn 错误:`, err.message);
+        console.error(`[gemini] spawn error:`, err.message);
         resolve(`⚠️ Gemini CLI 出错: ${sanitizeErrorMessage(err.message)}`);
       });
     });
